@@ -6,7 +6,7 @@
         var end = ee.Date('2024-12-01');
   
 // 2. Define sample location:
-        var point = ee.Geometry.Point(-17.5475, 65.8625)
+        var point = ee.Geometry.Point(-17.54551, 65.86271)
 
 //4. Set DEM. 
 
