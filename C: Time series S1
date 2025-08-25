@@ -1,0 +1,315 @@
+// ##########################   User Inputs: #########################################
+// ###################################################################################
+
+// 1. Set date range. 
+        var start = ee.Date('2019-01-01'); 
+        var end = ee.Date('2024-12-01');
+  
+// 2. Define sample location:
+        var point = ee.Geometry.Point(-17.5475, 65.8625)
+
+//4. Set DEM. 
+
+        //OPT1: GLobal 30 m (STRM):
+        // var DEM = ee.Image('USGS/SRTMGL1_003')
+        
+        //OPT2: Iceland 10 m
+         var DEM = ee.Image("projects/ee-landmaelingar/assets/IslandsDEMv1_10m_isn93")
+        
+        //OPT3: Scandinavia 10 m 
+        //var DEM = ee.Image("users/rangelandee/NINA/Raster/Fenoscandia_DTM_10m").rename('DTM');
+        
+        //OPT4: Canada, varying res
+        // var DEM_can = ee.ImageCollection("NRCan/CDEM")
+        
+        //OPT5: USA 10 m
+        // var DEM_USA = ee.Image("USGS/3DEP/10m")
+        
+        //OPT6: Australia 5 m
+        // var DEM_AUS = ee.ImageCollection("AU/GA/AUSTRALIA_5M_DEM") 
+
+// 5. Specify the time-window for moving-mean
+var days = 15;
+
+// ###################################################################################
+// Set up map 
+Map.centerObject(point, 14); 
+Map.setOptions('SATELLITE');
+        
+var patch = point.buffer(15).bounds()
+Map.addLayer(patch)
+Map.centerObject(patch)
+
+// ########################################################################################
+// SENTINEL 1
+// ########################################################################################
+
+// Correction function for radiometric slope correction on a Sentinel-1 image collection
+var slope_correction = function (collection,
+                                options
+                                ){
+
+    // set defaults if undefined options
+    options = options || {};
+    var model = options.model || 'volume';
+    // var elevation = options.elevation || ee.Image('users/jarnaalexandra/TerrengNorge3');
+    var elevation = options.elevation || ee.Image(DEM);  
+    var buffer = options.buffer || 0;
+
+    // we need a 90 degree in radians image for a couple of calculations
+    var ninetyRad = ee.Image.constant(90).multiply(Math.PI/180);
+
+    // Volumetric Model Hoekman 1990
+    function _volume_model(theta_iRad, alpha_rRad){
+
+      var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_rRad)).tan();
+      var denominator = (ninetyRad.subtract(theta_iRad)).tan();
+      return nominator.divide(denominator);
+    }
+
+    // surface model Ulander et al. 1996
+    function _surface_model(theta_iRad, alpha_rRad, alpha_azRad){
+
+      var nominator = (ninetyRad.subtract(theta_iRad)).cos();
+      var denominator = alpha_azRad.cos()
+        .multiply((ninetyRad.subtract(theta_iRad).add(alpha_rRad)).cos());
+      return nominator.divide(denominator);
+    }
+
+    // buffer function (thanks Noel)
+    function _erode(img, distance) {
+
+      var d = (img.not().unmask(1)
+          .fastDistanceTransform(30).sqrt()
+          .multiply(ee.Image.pixelArea().sqrt()));
+
+      return img.updateMask(d.gt(distance));
+    }
+
+    // calculate masks
+    function _masking(alpha_rRad, theta_iRad, proj, buffer){
+
+        // layover, where slope > radar viewing angle
+        var layover = alpha_rRad.lt(theta_iRad).rename('layover');
+
+        // shadow
+        var shadow = alpha_rRad.gt(ee.Image.constant(-1).multiply(ninetyRad.subtract(theta_iRad))).rename('shadow');
+
+        // combine layover and shadow
+        var mask = layover.and(shadow);
+
+        // add buffer to final mask
+        if (buffer > 0)
+            mask = _erode(mask, buffer);
+
+        return mask.rename('no_data_mask');
+  }
+
+    function _correct(image){
+
+        // get image geometry and projection
+        var geom = image.geometry();
+        var proj = image.select(1).projection();
+
+        // get look direction angle
+        var heading = (ee.Terrain.aspect(
+            image.select('angle')).reduceRegion(ee.Reducer.mean(), geom, 1000).get('aspect')
+            );
+
+        // Sigma0 to Power of input image
+        var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0));
+
+        // Radar geometry
+        var theta_iRad = image.select('angle').multiply(Math.PI/180).clip(geom);
+        var phi_iRad = ee.Image.constant(heading).multiply(Math.PI/180);
+
+        // Terrain geometry
+        var alpha_sRad = ee.Terrain.slope(elevation).select('slope')
+            .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+        var phi_sRad = ee.Terrain.aspect(elevation).select('aspect')
+            .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+
+        // Model geometry
+
+        //reduce to 3 angle
+        var phi_rRad = phi_iRad.subtract(phi_sRad);
+
+        // slope steepness in range
+        var alpha_rRad = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan();
+
+        // slope steepness in azimuth
+        var alpha_azRad = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan();
+
+        // Gamma_nought
+        var gamma0 = sigma0Pow .divide(theta_iRad.cos());
+
+              // models
+        if (model == 'volume')
+          var corrModel = _volume_model(theta_iRad, alpha_rRad);
+
+        if (model == 'surface')
+          var corrModel = _surface_model(theta_iRad, alpha_rRad, alpha_azRad);
+
+        if (model == 'direct')
+          var corrModel = _direct_model(theta_iRad, alpha_rRad, alpha_azRad);
+
+        // apply model to derive gamma0_flat
+        var gamma0_flat = gamma0.divide(corrModel);
+
+        // transform to dB-scale
+        var gamma0_flatDB = (ee.Image.constant(10)
+            .multiply(gamma0_flat.log10()).select(['VV', 'VH'])
+            );
+
+        // get Layover/Shadow mask
+        var mask = _masking(alpha_rRad, theta_iRad, proj, buffer);
+
+        // return gamma_flat plus mask
+        return gamma0_flatDB.addBands(mask).copyProperties(image);
+
+
+    }
+
+    // run correction function and return corrected collection
+    return collection.map(_correct);
+
+};
+
+// export function
+exports.slope_correction = slope_correction;
+
+// ########################################################################################
+
+// Get S1 data, filter according to location; Interferometric Wide mode; and dates. 
+var data = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(patch)
+  .filterMetadata('instrumentMode','equals','IW')
+  .filterDate(start, end)
+  
+// Create 2 sub-collections - ascending and descening.   
+var data_des = data.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+var data_asc = data.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+  
+print (data_des, 'desc_data');
+print (data_asc, 'asc_data');   
+  
+var s = data.aggregate_histogram('transmitterReceiverPolarisation')
+print('size of collection', data.size())
+
+// Appy terrain correction function to both sub-collections
+var corrected_des = slope_correction(data_des)
+  .map(function(im) {
+    return im.updateMask(im.select('no_data_mask')).set('system:time_start',im.getNumber('segmentStartTime')).clip(patch)
+  }).select(['VV', 'VH'])
+  .map(function(image) {
+          var edge = image.lt(-30.0); //remove low edge values as suggested by GEE
+          var maskedImage = image.mask().and(edge.not());
+          return image.updateMask(maskedImage);
+        });
+  
+var corrected_asc = slope_correction(data_asc)
+  .map(function(im) {
+    return im.updateMask(im.select('no_data_mask')).set('system:time_start',im.getNumber('segmentStartTime')).clip(patch)
+  }).select(['VV', 'VH'])        
+  .map(function(image) {
+          var edge = image.lt(-30.0); //remove low edge values as suggested by GEE
+          var maskedImage = image.mask().and(edge.not());
+          return image.updateMask(maskedImage);
+        });
+  
+// ########################################################################################
+// Moving-Window Smoothing 
+// makes the moving mean depending on the number of days specified above. 
+// Modified from Ujaval Gandhi, https://bit.ly/g4g22-time-series 
+
+// Convert to milliseconds 
+var millis = ee.Number(days).multiply(1000*60*60*24);
+
+// We use a 'save-all join' to find all images that are within the time-window
+// The join will add all matching images into a new property called 'images'
+var join = ee.Join.saveAll({
+  matchesKey: 'images'
+});
+
+// This filter will match all images that are captured
+// within the specified day of the source image
+var diffFilter = ee.Filter.maxDifference({
+  difference: millis,
+  leftField: 'system:time_start', 
+  rightField: 'system:time_start'
+});
+
+var joinedCollection_des = join.apply({
+  primary: corrected_des, 
+  secondary: corrected_des, 
+  condition: diffFilter
+});
+
+var joinedCollection_asc = join.apply({
+  primary: corrected_asc, 
+  secondary: corrected_asc, 
+  condition: diffFilter
+});
+
+// Each image in the joined collection will contain
+// matching images in the 'images' property
+// Extract and return the mean of matched images
+var extractAndComputeMean = function(image) {
+  var matchingImages = ee.ImageCollection.fromImages(image.get('images'));
+  var meanImage = matchingImages.reduce(
+    ee.Reducer.mean().setOutputs(['moving_average']))
+  return ee.Image(image).addBands(meanImage)
+}
+
+var smoothedCollection_des = ee.ImageCollection(
+  joinedCollection_des.map(extractAndComputeMean));
+  
+var smoothedCollection_asc = ee.ImageCollection(
+  joinedCollection_asc.map(extractAndComputeMean));
+
+// ########################################################################################
+// Display a time-series chart
+var chart_des = ui.Chart.image.series({
+  imageCollection: smoothedCollection_des.select(['VV', 'VV_moving_average', 'VH', 'VH_moving_average']),
+  region: patch,
+  reducer: ee.Reducer.mean(),
+  scale: 20
+}).setOptions({
+      title: 'Sentinel 1 Descending',
+      interpolateNulls: false,
+      vAxis: {title: 'Backscatter coefficient [dB]'},
+      hAxis: {title: '', format: 'YYYY-MM'},
+      lineWidth: 1,
+//      pointSize: 4,
+      series: {
+      0: {color: '#66c2a4', lineDashStyle: [1, 1], pointSize: 2}, // Original VV
+      1: {color: '#238b45', lineWidth: 2 }, // Smoothed VV
+      2: {color: '#b3ccf4', lineDashStyle: [1, 1], pointSize: 2}, // Original VH
+      3: {color: '#0a48ae', lineWidth: 2 }, // Smoothed VH
+      },
+
+    })
+print(chart_des);
+
+
+var chart_asc = ui.Chart.image.series({
+  imageCollection: smoothedCollection_asc.select(['VV', 'VV_moving_average', 'VH', 'VH_moving_average']),
+  region: patch,
+  reducer: ee.Reducer.mean(),
+  scale: 20
+}).setOptions({
+      title: 'Sentinel 1 Ascending',
+      interpolateNulls: false,
+      vAxis: {title: 'Backscatter coefficient [dB]'},//, viewWindow: {min: -30, max: 10}
+      hAxis: {title: '', format: 'YYYY-MM'},
+      lineWidth: 1,
+//      pointSize: 4,
+      series: {
+      0: {color: '#66c2a4', lineDashStyle: [1, 1], pointSize: 2}, // Original VV
+      1: {color: '#238b45', lineWidth: 2 }, // Smoothed VV
+      2: {color: '#b3ccf4', lineDashStyle: [1, 1], pointSize: 2}, // Original VH
+      3: {color: '#0a48ae', lineWidth: 2 }, // Smoothed VH
+      },
+
+    })
+print(chart_asc);
