@@ -1,0 +1,415 @@
+
+/***************************************************************************************
+ * Title: Change Detection with Sentinel-1 & Sentinel-2 for Landslide Analysis (GEE)
+ *
+ * Purpose:
+ *   Produce SAR/optical change images to support landslide analysis and training data
+ *   creation. The workflow pre-processes Sentinel-1 (SAR) and Sentinel-2 (optical),
+ *   applies terrain (topographic) correction to SAR, builds pre/post composites,
+ *   computes differences, visualizes layers
+ *
+ * Sources & Credits:
+ *   - Sentinel-1 GRD and Sentinel-2 SR via Google Earth Engine.
+ *   - S1 slope-correction adapted from Andreas Vollrath (ESA), with a bug fix by
+ *     Eric Bullock (USDA). Original tutorial: https://www.youtube.com/watch?v=JZbLokRI8as&t=1210s
+ *
+ ***************************************************************************************/
+
+// OPEN GOOGLE EARTH ENGINE (JAVASCRIPT) CODE EDITOR https://code.earthengine.google.com/  
+// Paste this script into the code editor. 
+// Click RUN. 
+
+// The script can be modified to run for other case studies by adjusting the location coordinates, date ranges, DEM. 
+// If the area is mainly forested - change to volumetric model (Line 119)
+// Toggle on and off the layers using the LAYERS menu (right)
+
+/*======================================================================================
+  0) USER INPUTS
+======================================================================================*/
+
+// 0.1 Area of Interest (AOI)
+var point = ee.Geometry.Point([-17.5558, 65.8674]);
+
+// 0.2 Date ranges for composites
+// PRE-EVENT IMAGE (dates over which to create a composite)
+var pre_start  = ee.Date('2021-07-01');
+var pre_end    = ee.Date('2021-09-30');
+
+// POST-EVENT IMAGE (dates over which to create a median composite)
+var post_start = ee.Date('2022-07-01');
+var post_end   = ee.Date('2022-09-30');
+
+// 0.3 Google Drive export folder name
+var my_google_drive_folder = "earthengine";
+
+// 0.4 DEM selection
+// Global example: NASA SRTM Digital Elevation 30m
+//var DEM = ee.Image('USGS/SRTMGL1_003');
+
+// Iceland (used here):
+var DEM = ee.Image("projects/ee-landmaelingar/assets/IslandsDEMv1_10m_isn93").rename('elevation');
+
+
+/*======================================================================================
+  1) STUDY REGION GEOMETRY
+======================================================================================*/
+
+var region = point.buffer(2000).bounds(); // Adjust buffer to change AOI size
+Map.centerObject(region);
+
+
+/*======================================================================================
+  2) SENTINEL-1 IMAGE COLLECTIONS (Pre/Post, Asc/Des)
+======================================================================================*/
+
+// Pre-event (ASCENDING)
+var pre_data_asc = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterMetadata('transmitterReceiverPolarisation','equals',["VV", "VH"])
+  .filterMetadata('orbitProperties_pass', 'equals', 'ASCENDING')
+  .filterMetadata('instrumentMode','equals','IW')
+  .filterDate(pre_start, pre_end);
+
+// Post-event (ASCENDING)
+var post_data_asc = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterMetadata('transmitterReceiverPolarisation','equals',["VV", "VH"])
+  .filterMetadata('orbitProperties_pass', 'equals', 'ASCENDING')
+  .filterMetadata('instrumentMode','equals','IW')
+  .filterDate(post_start, post_end);
+
+// Pre-event (DESCENDING)
+var pre_data_des = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterMetadata('transmitterReceiverPolarisation','equals',["VV", "VH"])
+  .filterMetadata('orbitProperties_pass', 'equals', 'DESCENDING')
+  .filterMetadata('instrumentMode','equals','IW')
+  .filterDate(pre_start, pre_end);
+
+// Post-event (DESCENDING)
+var post_data_des = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterMetadata('transmitterReceiverPolarisation','equals',["VV", "VH"])
+  .filterMetadata('orbitProperties_pass', 'equals', 'DESCENDING')
+  .filterMetadata('instrumentMode','equals','IW')
+  .filterDate(post_start, post_end);
+
+// Counts
+print('no. in pre_asc collection',  pre_data_asc.size());
+print('no. in post_asc collection', post_data_asc.size());
+print('no. in pre_des collection',  pre_data_des.size());
+print('no. in post_des collection', post_data_des.size());
+
+
+/*======================================================================================
+  3) TOPOGRAPHIC CORRECTION (Radiometric slope correction)
+     Adapted from Andreas Vollrath with bug fix by Eric Bullock
+======================================================================================*/
+
+/**
+* Radiometric slope correction algorithm for topographic correction
+* The library by Andreas Vollrath that has topographic slope correction described in https://doi.org/10.3390/rs12111867
+* This is a copy of Vollrath's script with a bug fix (by Eric Bullock) 
+*/
+var slope_correction = function (collection, options){
+
+  // set defaults if undefined options
+  options = options || {};
+  var model = options.model || 'surface'; // CHANGE to 'volumetric' if area is mainly forested 
+  var elevation = options.elevation || DEM
+  var buffer = options.buffer || 0;
+
+  // we need a 90 degree in radians image for a couple of calculations
+  var ninetyRad = ee.Image.constant(90).multiply(Math.PI/180);
+
+  // Volumetric Model Hoekman 1990
+  function _volume_model(theta_iRad, alpha_rRad){
+    var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_rRad)).tan();
+    var denominator = (ninetyRad.subtract(theta_iRad)).tan();
+    return nominator.divide(denominator);
+  }
+
+  // surface model Ulander et al. 1996
+  function _surface_model(theta_iRad, alpha_rRad, alpha_azRad){
+    var nominator = (ninetyRad.subtract(theta_iRad)).cos();
+    var denominator = alpha_azRad.cos()
+      .multiply((ninetyRad.subtract(theta_iRad).add(alpha_rRad)).cos());
+    return nominator.divide(denominator);
+  }
+
+  // buffer function (thanks Noel)
+  function _erode(img, distance) {
+    var d = (img.not().unmask(1)
+        .fastDistanceTransform(30).sqrt()
+        .multiply(ee.Image.pixelArea().sqrt()));
+    return img.updateMask(d.gt(distance));
+  }
+
+  // calculate masks
+  function _masking(alpha_rRad, theta_iRad, proj, buffer){
+      // layover, where slope > radar viewing angle
+      var layover = alpha_rRad.lt(theta_iRad).rename('layover');
+      // shadow
+      var shadow = alpha_rRad.gt(ee.Image.constant(-1).multiply(ninetyRad.subtract(theta_iRad))).rename('shadow');
+      // combine layover and shadow
+      var mask = layover.and(shadow);
+      // add buffer to final mask
+      if (buffer > 0)
+          mask = _erode(mask, buffer);
+      return mask.rename('no_data_mask');
+  }
+
+  function _correct(image){
+      // get image geometry and projection
+      var geom = image.geometry();
+      var proj = image.select(1).projection();
+      // get look direction angle
+      var heading = (ee.Terrain.aspect(
+          image.select('angle')).reduceRegion(ee.Reducer.mean(), geom, 1000).get('aspect')
+          );
+      // Sigma0 to Power of input image
+      var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0));
+      // Radar geometry
+      var theta_iRad = image.select('angle').multiply(Math.PI/180).clip(geom);
+      var phi_iRad = ee.Image.constant(heading).multiply(Math.PI/180);
+      // Terrain geometry
+      var alpha_sRad = ee.Terrain.slope(elevation).select('slope')
+          .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+      var phi_sRad = ee.Terrain.aspect(elevation).select('aspect')
+          .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+      // Model geometry
+      //reduce to 3 angle
+      var phi_rRad = phi_iRad.subtract(phi_sRad);
+      // slope steepness in range
+      var alpha_rRad = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan();
+      // slope steepness in azimuth
+      var alpha_azRad = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan();
+      // Gamma_nought
+      var gamma0 = sigma0Pow.divide(theta_iRad.cos());
+            // models
+          if (model == 'volume')
+            var corrModel = _volume_model(theta_iRad, alpha_rRad);
+          if (model == 'surface')
+            var corrModel = _surface_model(theta_iRad, alpha_rRad, alpha_azRad);
+          if (model == 'direct')
+            var corrModel = _direct_model(theta_iRad, alpha_rRad, alpha_azRad);
+      // apply model to derive gamma0_flat
+      var gamma0_flat = gamma0.divide(corrModel);
+      // transform to dB-scale
+      var gamma0_flatDB = (ee.Image.constant(10)
+          .multiply(gamma0_flat.log10()).select(['VV', 'VH'])
+          );
+      // get Layover/Shadow mask
+      var mask = _masking(alpha_rRad, theta_iRad, proj, buffer);
+      // return gamma_flat plus mask
+      return gamma0_flatDB.addBands(mask).copyProperties(image);
+  }
+
+  // run correction function and return corrected collection
+  return collection.map(_correct);
+
+};
+
+// export function
+exports.slope_correction = slope_correction;
+
+
+function terrainCorrection(image) {
+  var imgGeom = image.geometry()
+  var srtm = DEM.clip(imgGeom) // 10m dtm
+  var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0))
+
+  // 2.1.1 Radar geometry 
+  var theta_i = image.select('angle')
+  var phi_i = ee.Terrain.aspect(theta_i)
+    .reduceRegion(ee.Reducer.mean(), theta_i.get('system:footprint'), 1000)
+    .get('aspect')
+
+  // 2.1.2 Terrain geometry
+  var alpha_s = ee.Terrain.slope(srtm).select('slope')
+  var phi_s = ee.Terrain.aspect(srtm).select('aspect')
+
+  // 2.1.3 Model geometry
+  var phi_r = ee.Image.constant(phi_i).subtract(phi_s)
+
+  // convert all to radians
+  var phi_rRad = phi_r.multiply(Math.PI / 180)
+  var alpha_sRad = alpha_s.multiply(Math.PI / 180)
+  var theta_iRad = theta_i.multiply(Math.PI / 180)
+  var ninetyRad = ee.Image.constant(90).multiply(Math.PI / 180)
+
+  // slope steepness in range (eq. 2)
+  var alpha_r = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan()
+
+  // slope steepness in azimuth (eq 3)
+  var alpha_az = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan()
+
+  // local incidence angle (eq. 4)
+  var theta_lia = (alpha_az.cos().multiply((theta_iRad.subtract(alpha_r)).cos())).acos()
+  var theta_liaDeg = theta_lia.multiply(180 / Math.PI)
+  
+  // 2.2 
+  // Gamma_nought_flat
+  var gamma0 = sigma0Pow.divide(theta_iRad.cos())
+  var gamma0dB = ee.Image.constant(10).multiply(gamma0.log10())
+  var ratio_1 = gamma0dB.select('VV').subtract(gamma0dB.select('VH'))
+
+  // Volumetric Model
+  var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_r)).tan()
+  var denominator = (ninetyRad.subtract(theta_iRad)).tan()
+  var volModel = (nominator.divide(denominator)).abs()
+
+  // apply model
+  var gamma0_Volume = gamma0.divide(volModel)
+  var gamma0_VolumeDB = ee.Image.constant(10).multiply(gamma0_Volume.log10())
+
+  // layover (where slope > radar viewing angle)
+  var alpha_rDeg = alpha_r.multiply(180 / Math.PI);
+  var layover = alpha_rDeg.lt(theta_i);
+
+  // shadow (where LIA > 90 -> threshold here 85)
+  var shadow = theta_liaDeg.lt(85);
+  
+  // lia
+  var liaDeg = theta_liaDeg;
+
+  // ratio for RGB vis
+  var ratio = gamma0_VolumeDB.select('VV').subtract(gamma0_VolumeDB.select('VH'));
+
+  var output = gamma0_VolumeDB.addBands(ratio).addBands(alpha_r).addBands(phi_s).addBands(theta_iRad)
+    .addBands(layover).addBands(shadow).addBands(liaDeg).addBands(gamma0dB).addBands(ratio_1);
+
+  return image.addBands(
+    output.select(['VV', 'VH', 'slope_1', 'slope_2', 'slope_3'], ['VV', 'VH', 'layover', 'shadow', 'liaDeg']),
+    null,
+    true
+  );
+}
+
+
+/*======================================================================================
+  4) CREATE TERRAIN-CORRECTED PRE/POST IMAGES & DIFFERENCES
+======================================================================================*/
+
+// ASCENDING: pre, distortions, post
+var pre_corrected_asc = slope_correction(pre_data_asc)
+  .map(function(im) {return im.updateMask(im.select('no_data_mask'))})  // Apply no data mask
+  .reduce(ee.Reducer.median())                                          // Median of collection
+  .rename(pre_data_asc.first().bandNames())
+  .clip(region);
+
+// Apply terrain correction function -> LIA & distortions (ASC)
+var asc_LIA_distortions = pre_data_asc
+  .map(terrainCorrection)
+  .reduce(ee.Reducer.median())  
+  .select(['layover_median', 'shadow_median', 'liaDeg_median'], ['layover', 'shadow', 'liaDeg'])
+  .clip(region);
+
+var post_corrected_asc = slope_correction(post_data_asc)
+  .map(function(im) {return im.updateMask(im.select('no_data_mask'))}) // Apply no data mask
+  .reduce(ee.Reducer.median())
+  .rename(post_data_asc.first().bandNames())
+  .clip(region);
+
+// DESCENDING: pre, post
+var pre_corrected_des = slope_correction(pre_data_des)
+  .map(function(im) {return im.updateMask(im.select('no_data_mask'))})  // Apply no data mask
+  .reduce(ee.Reducer.median())                                          // Median of collection
+  .rename(pre_data_des.first().bandNames())
+  .clip(region);
+
+var post_corrected_des = slope_correction(post_data_des)
+  .map(function(im) {return im.updateMask(im.select('no_data_mask'))}) // Apply no data mask
+  .reduce(ee.Reducer.median())
+  .rename(post_data_des.first().bandNames())
+  .clip(region);
+
+// Rename bands for pre/post
+var pre_VV_asc = pre_corrected_asc.select('VV').rename('preVV');
+var pre_VH_asc = pre_corrected_asc.select('VH').rename('preVH');
+var pre_VV_des = pre_corrected_des.select('VV').rename('preVV');
+var pre_VH_des = pre_corrected_des.select('VH').rename('preVH');
+
+var post_VV_asc = post_corrected_asc.select('VV').rename('postVV');
+var post_VH_asc = post_corrected_asc.select('VH').rename('postVH');
+var post_VV_des = post_corrected_des.select('VV').rename('postVV');
+var post_VH_des = post_corrected_des.select('VH').rename('postVH');
+
+// Differences (post - pre)
+var diff_VV_asc = (post_VV_asc.subtract(pre_VV_asc)).rename('dVV');
+var diff_VH_asc = (post_VH_asc.subtract(pre_VH_asc)).rename('dVH');
+var diff_VV_des = (post_VV_des.subtract(pre_VV_des)).rename('dVV');
+var diff_VH_des = (post_VH_des.subtract(pre_VH_des)).rename('dVH');
+
+// Visualisation function: S1 difference images 
+var diff_viz = {
+  min: -10, max: 10,
+  palette: ['#071431','#0e2761','#074aac','#2e67e1','#4e7eec','#6a89ee','#82a6ff','#95b4fd',
+            '#b2ccf3','#cfd7fd','#fefcba','#ffcd80','#fbb473','#ff9e64','#ff7138','#f3512a',
+            '#df3118','#bf0304','#8b0000','#490000']
+};
+
+
+/*======================================================================================
+  4) SENTINEL-2 PROCESSING (RGB, NDVI, dNDVI)
+======================================================================================*/
+
+// Visualization parameters
+var dNDVI_params = {bands:"dNDVI", min:-0.6, max:0.1};                // dNDVI
+var viz_rgb      = {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000, gamma: 1.5}; // True color
+
+// NDVI helper
+function addS2NDVI(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+}
+
+// Sentinel-2 SR collection
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+
+// Pre-image (least cloudy)
+var pre_filtered = S2.filterDate(pre_start, pre_end)
+  .filterBounds(region)
+  .map(addS2NDVI);
+print('size of S2 pre collection', pre_filtered.size());
+var pre_image = ee.Image(pre_filtered.sort('CLOUDY_PIXEL_PERCENTAGE').first())
+  .select(['B2', 'B3', 'B4', 'B8', 'NDVI']).clip(region);
+
+// Post-image (least cloudy within custom range)
+var post_filtered = S2.filterDate('2022-07-30', '2022-08-30')  // Adjust as needed
+  .filterBounds(region)
+  .map(addS2NDVI);
+print('size of S2 post collection', post_filtered.size());
+var post_image = ee.Image(post_filtered.sort('CLOUDY_PIXEL_PERCENTAGE').first())
+  .select(['B2', 'B3', 'B4', 'B8', 'NDVI']).clip(region);
+
+// dNDVI
+var dNDVI = post_image.subtract(pre_image).select('NDVI').rename('dNDVI');
+
+
+/*======================================================================================
+  6) TERRAIN DERIVATIVES & DIFF COLOR TABLE
+======================================================================================*/
+
+var DEM_clip = DEM.toFloat().clip(region);
+var hillshade = ee.Terrain.hillshade(DEM_clip, 135, 45);
+var slope = ee.Terrain.slope(DEM_clip);
+
+
+/*======================================================================================
+  7) MAP LAYERS (optional toggles)
+======================================================================================*/
+
+Map.addLayer(hillshade, {}, 'hillshade', false);
+Map.addLayer(slope, {'min':0, 'max':90, palette: ['blue', 'green','yellow','orange','red']}, 'slope', false);
+Map.addLayer(pre_image,  viz_rgb,    'pre-event RGB least clouds',  false);
+Map.addLayer(post_image, viz_rgb,    'post-event RGB least clouds', false);
+Map.addLayer(dNDVI,      dNDVI_params, 'dNDVI');
+Map.addLayer(diff_VH_des, diff_viz, 'VH descending diff', false);
+Map.addLayer(diff_VV_des, diff_viz, 'VV descending diff');
+Map.addLayer(diff_VH_asc, diff_viz, 'VH ascending diff',  false);
+Map.addLayer(diff_VV_asc, diff_viz, 'VV ascending diff',  false);
+
+
+
+
