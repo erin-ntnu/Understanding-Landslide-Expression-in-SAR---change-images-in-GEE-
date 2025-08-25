@@ -7,6 +7,7 @@ https://earthengine.google.com/noncommercial/
 There are two GEE scripts for producing images available in this repository: 
 
 A. SHORT: Change images only - S1 & S2
+
 B. FULL: Change images, environmental context layers, and landcover classification
 
 IMPORT GEOMETRIES: 
